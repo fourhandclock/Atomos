@@ -12,3 +12,25 @@ glad.c -- in same directory as main
 
 
 ![build instrcurtions](gallery/image.png)
+
+## Build
+
+```bash
+git clone https://github.com/inhumanetrial/Atomos.git
+cd Atomos
+
+cmake -B build
+cmake --build build
+```
+
+Run:
+
+```bash
+./build/Atomos
+```
+
+or on Windows:
+
+```bash
+.\build\Debug\Atomos.exe
+```
