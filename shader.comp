@@ -1,0 +1,141 @@
+#version 430 core
+
+layout (local_size_x = 8, local_size_y = 8) in;
+layout (rgba32f, binding = 0) uniform image2D img_output;
+
+uniform vec3 camPos;
+uniform vec3 camDir;
+uniform vec3 camUp;
+uniform vec3 camRight;
+uniform vec3 sunDir; 
+uniform int frameCount;
+
+// Physics Constants
+const float EARTH_RADIUS = 6360000.0;
+const float ATMOSPHERE_RADIUS = 6460000.0;
+const float RAYLEIGH_HEIGHT = 7994.0;
+// Rayleigh scattering coefficients for Red, Green, Blue wavelengths
+const vec3 BETA_R = vec3(5.5e-6, 13.0e-6, 22.4e-6); 
+float opticalDepthView = 0.0;
+const float PI = 3.14159265359;
+
+// --- MIE CONSTANTS (Haze / Sun Glare) ---
+const float MIE_HEIGHT = 1200.0; 
+const vec3 BETA_M = vec3(21.0e-6);
+const float MIE_G = 0.76;
+
+// Ray-Sphere Intersection 
+float raySphereIntersect(vec3 origin, vec3 dir, float radius) {
+    float b = dot(origin, dir);
+    float c = dot(origin, origin) - (radius * radius);
+    float d = b * b - c;
+    if (d < 0.0) return -1.0;
+    return -b + sqrt(d); 
+}
+
+// Rayleigh Phase Function: P(θ) = (3/4)(1 + cos²θ)
+float phaseRayleigh(float cosTheta) {
+    return (3.0 / (16.0 * PI)) * (1.0 + cosTheta * cosTheta); // after normalization
+}
+// Mie Phase Function (Henyey-Greenstein)
+float phaseMie(float cosTheta) {
+    float g2 = MIE_G * MIE_G;
+    float num = 1.0 - g2;
+    float den = 4.0 * PI * pow(1.0 + g2 - 2.0 * MIE_G * cosTheta, 1.5);
+    return num / den;
+}
+// RNG
+uint rngState; 
+uint pcg_hash(uint seed) {
+    uint state = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+float randomFloat() {
+    rngState = pcg_hash(rngState);
+    return float(rngState) / float(0xFFFFFFFFu);
+}
+
+// Optical Depth
+vec2 getOpticalDepth(vec3 origin, vec3 dir, float dist, int steps) {
+    float stepSize = dist / float(steps);
+    vec2 depth = vec2(0.0);
+    
+    for (int i = 0; i < steps; ++i) {
+        // Shift sample point to the middle of the segment for better accuracy
+        vec3 p = origin + dir * (float(i) * stepSize + stepSize * 0.5);
+        float height = length(p) - EARTH_RADIUS;
+        
+        depth.x += exp(-height / RAYLEIGH_HEIGHT) * stepSize;
+        depth.y += exp(-height / MIE_HEIGHT) * stepSize;
+    }
+    return depth;
+}
+
+void main() {
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(img_output);
+    
+    // Bounds check
+    if (pixel_coords.x >= dims.x || pixel_coords.y >= dims.y) return;
+
+    uint pixelIndex = uint(pixel_coords.y * dims.x + pixel_coords.x);
+    rngState = pcg_hash(pixelIndex + uint(frameCount) * 719393u);
+
+    // Convert pixel to NDC (-1 to 1)
+    vec2 uv = vec2(pixel_coords) / vec2(dims) * 2.0 - 1.0;
+    
+    // Standard perspective ray generation
+    float fovScale = 1.0; // Adjust for FOV
+    vec3 rayDir = normalize(camDir + uv.x * camRight * fovScale + uv.y * camUp * fovScale);
+    
+    float distToAtmosphere = raySphereIntersect(camPos, rayDir, ATMOSPHERE_RADIUS);
+    vec3 totalScatteredLight = vec3(0.0);
+    vec3 finalColor = vec3(0.0);
+
+    if (distToAtmosphere > 0.0) {
+        int viewSteps = 16;
+        float stepSize = distToAtmosphere / float(viewSteps);
+        
+        float cosTheta = dot(rayDir, sunDir);
+        float phaseR = phaseRayleigh(cosTheta);
+        float phaseM = phaseMie(cosTheta);
+        
+        vec3 totalRayleigh = vec3(0.0);
+        vec3 totalMie = vec3(0.0);
+        
+        // OPTIMIZATION 1: Keep a running total of the view ray's optical depth!
+        vec2 accumulatedViewDepth = vec2(0.0);
+        
+        for (int i = 0; i < viewSteps; ++i) {
+            vec3 p = camPos + rayDir * (float(i) * stepSize + stepSize * 0.5);
+            float height = length(p) - EARTH_RADIUS;
+            
+            float densityR = exp(-height / RAYLEIGH_HEIGHT);
+            float densityM = exp(-height / MIE_HEIGHT);
+            
+            // Add to the running total (Replaces the entire 50-step inner loop)
+            accumulatedViewDepth.x += densityR * stepSize;
+            accumulatedViewDepth.y += densityM * stepSize;
+            
+            float distToSun = raySphereIntersect(p, sunDir, ATMOSPHERE_RADIUS);
+            
+            // OPTIMIZATION 2: Only use 8 steps for the shadow ray
+            vec2 depthSun = getOpticalDepth(p, sunDir, distToSun, 8);
+            
+            vec3 transmittance = exp(-(BETA_R * (accumulatedViewDepth.x + depthSun.x) + 
+                                       BETA_M * (accumulatedViewDepth.y + depthSun.y)));
+            
+            totalRayleigh += densityR * transmittance * stepSize;
+            totalMie += densityM * transmittance * stepSize;
+        }
+        
+        finalColor = (totalRayleigh * BETA_R * phaseR + totalMie * BETA_M * phaseM) * 20.0;
+    }
+    
+  // HDR Tonemapping (Exposure) applied to finalColor
+    finalColor = vec3(1.0) - exp(-finalColor * 1.0);
+
+    // Give finalColor to the screen, NOT totalScatteredLight
+    imageStore(img_output, pixel_coords, vec4(finalColor, 1.0));
+}
